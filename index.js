@@ -11,8 +11,6 @@ db.load();
 const cfg  = getConfig();
 const rest = new REST({ version: '10' }).setToken(cfg.token);
 
-console.log(`📬  DMs: ${cfg.sendDMs ? 'ENABLED' : 'DISABLED (set SEND_DMS=true in Railway to enable)'}`);
-
 // ── Client ────────────────────────────────────────────────────────────────────
 
 const client = new Client({
@@ -25,9 +23,9 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ── Vanity cache — fetch once per guild, not on every join ───────────────────
+// ── Vanity cache — fetched once per guild, not on every join ─────────────────
 
-const vanityCache = new Map(); // guildId → code | null
+const vanityCache = new Map();
 
 async function getVanity(guild) {
   if (vanityCache.has(guild.id)) return vanityCache.get(guild.id);
@@ -39,6 +37,100 @@ async function getVanity(guild) {
     vanityCache.set(guild.id, null);
     return null;
   }
+}
+
+// ── DM + Kick queue ───────────────────────────────────────────────────────────
+//
+// Every unauthorized join is added here. The queue processor handles one
+// member at a time: DM first → kick after. A configurable gap between
+// each DM prevents rate limiting even during mass-join events.
+//
+// If 50 people join at once:
+//   - All 50 are queued immediately
+//   - Queue drains at 1 per 1.2s → all processed in ~60s
+//   - Everyone gets a DM before their kick, no one is missed
+
+const kickQueue   = [];   // { member, guild, joinedAt, createdAt, avatar }
+let   queueActive = false;
+
+function enqueue(member, guild) {
+  kickQueue.push({
+    member,
+    guild,
+    joinedAt:  Math.floor(Date.now() / 1000),
+    createdAt: Math.floor(member.user.createdTimestamp / 1000),
+    avatar:    member.user.displayAvatarURL(),
+  });
+  console.log(`⏳ [QUEUED] ${member.user.tag} in ${guild.name} — queue depth: ${kickQueue.length}`);
+  if (!queueActive) drainQueue();
+}
+
+async function drainQueue() {
+  if (queueActive) return;
+  queueActive = true;
+
+  while (kickQueue.length > 0) {
+    const item = kickQueue.shift();
+    await processItem(item);
+
+    // Rate-limit gap between DMs — only applied when more items are waiting
+    if (kickQueue.length > 0) {
+      await sleep(cfg.dmDelay);
+    }
+  }
+
+  queueActive = false;
+}
+
+async function processItem({ member, guild, joinedAt, createdAt, avatar }) {
+  const vanity = vanityCache.get(guild.id) ?? null;
+  db.incrementVanityJoin(vanity);
+
+  // ── Step 1: DM — always attempted first ─────────────────────────────────────
+  let dmSent = false, dmErr = '';
+  try {
+    await member.user.send({
+      embeds:     [buildDMEmbed(guild.name, vanity)],
+      components: [buildDMRow()],
+    });
+    dmSent = true;
+    db.increment('dmsSent');
+    console.log(`📨 [DM OK]  ${member.user.tag}`);
+  } catch (err) {
+    dmErr = err.message;
+    db.increment('dmsFailed');
+    console.warn(`⚠️ [DM ERR] ${member.user.tag}: ${err.message}`);
+  }
+
+  // ── Step 2: Kick — always, even if DM failed ─────────────────────────────────
+  let kickOk = false, kickErr = '';
+  try {
+    await member.kick('Unauthorized — not on the whitelist.');
+    kickOk = true;
+    db.increment('successfulKicks');
+    db.incrementVanityKick(vanity);
+    console.log(`✅ [KICKED] ${member.user.tag} from ${guild.name}`);
+  } catch (err) {
+    kickErr = err.message;
+    db.increment('failedKicks');
+    console.error(`❌ [KICK FAIL] ${member.user.tag} in ${guild.name}: ${err.message}`);
+  }
+
+  // ── Step 3: Log to channel ────────────────────────────────────────────────────
+  await postLog(new EmbedBuilder()
+    .setColor(kickOk ? 0xff4444 : 0xff9900)
+    .setTitle(kickOk ? '🚫 Unauthorized Member Kicked' : '⚠️ Kick Failed')
+    .setThumbnail(avatar)
+    .addFields(
+      { name: 'Server',  value: `${guild.name} (\`${guild.id}\`)`,                       inline: false },
+      { name: 'Vanity',  value: vanity ? `\`/${vanity}\`` : '_None_',                    inline: true  },
+      { name: 'User',    value: `${member.user.tag}\n<@${member.user.id}>`,              inline: true  },
+      { name: 'ID',      value: `\`${member.user.id}\``,                                 inline: true  },
+      { name: 'Account', value: `<t:${createdAt}:R>`,                                    inline: true  },
+      { name: 'Joined',  value: `<t:${joinedAt}:R>`,                                     inline: true  },
+      { name: 'DM',      value: dmSent ? '✅ Sent'    : `❌ Failed\n\`${dmErr}\``,      inline: true  },
+      { name: 'Kick',    value: kickOk ? '✅ Success' : `❌ Failed\n\`${kickErr}\`\n*Check bot role in Server Settings → Roles*`, inline: true },
+    ).setFooter({ text: statsFooter() }).setTimestamp());
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -56,9 +148,9 @@ const COMMANDS = [
     .setName('gate').setDescription('Control the auto-kick gate').setDefaultMemberPermissions(8)
     .addSubcommand(s => s.setName('on').setDescription('Enable gate globally + sweep unauthorized members now'))
     .addSubcommand(s => s.setName('off').setDescription('Disable gate for ALL servers'))
-    .addSubcommand(s => s.setName('status').setDescription('Show gate state per server'))
-    .addSubcommand(s => s.setName('reset').setDescription('Force gate ON, clear all exceptions, sweep all servers'))
-    .addSubcommand(s => s.setName('sweep').setDescription('Manually kick all unauthorized members in active servers right now'))
+    .addSubcommand(s => s.setName('status').setDescription('Show gate state + kick permissions per server'))
+    .addSubcommand(s => s.setName('reset').setDescription('Force gate ON, clear all exceptions, sweep everything'))
+    .addSubcommand(s => s.setName('sweep').setDescription('Manually kick all unauthorized members in active servers'))
     .addSubcommandGroup(g => g.setName('server').setDescription('Per-server gate control')
       .addSubcommand(s => s.setName('add').setDescription('Turn gate off for specific servers')
         .addStringOption(o => o.setName('ids').setDescription('Comma-separated server IDs — blank = current server').setRequired(false)))
@@ -106,7 +198,7 @@ const COMMANDS = [
 
 ].map(c => c.toJSON());
 
-// ── Command sync — batched to avoid rate limits ───────────────────────────────
+// ── Command sync — batched ────────────────────────────────────────────────────
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -125,35 +217,74 @@ async function syncAllGuilds() {
   console.log(`🔄  Syncing commands to ${guilds.length} guild(s)...`);
   let ok = 0;
   for (let i = 0; i < guilds.length; i += 5) {
-    const batch   = guilds.slice(i, i + 5);
-    const results = await Promise.allSettled(batch.map(syncToGuild));
-    ok += results.filter(r => r.status === 'fulfilled' && r.value).length;
+    const res = await Promise.allSettled(guilds.slice(i, i + 5).map(syncToGuild));
+    ok += res.filter(r => r.status === 'fulfilled' && r.value).length;
     if (i + 5 < guilds.length) await sleep(1000);
   }
   console.log(`✅  Commands synced to ${ok}/${guilds.length} guilds`);
 }
 
-// ── Log channel ───────────────────────────────────────────────────────────────
+// ── Sweep ─────────────────────────────────────────────────────────────────────
+
+async function sweepGuild(guild) {
+  if (!db.isGateActive(guild.id)) return { kicked: 0, failed: 0 };
+  let kicked = 0, failed = 0;
+  try {
+    const members = await guild.members.fetch();
+    const targets = [...members.values()].filter(m =>
+      !m.user.bot && m.id !== client.user.id && !db.isAuthorized(m.user.id)
+    );
+    if (!targets.length) return { kicked: 0, failed: 0 };
+    console.log(`🧹  ${guild.name}: ${targets.length} to sweep`);
+    const vanity = await getVanity(guild);
+    for (const member of targets) {
+      // DM first
+      try {
+        await member.user.send({ embeds: [buildDMEmbed(guild.name, vanity)], components: [buildDMRow()] });
+        db.increment('dmsSent');
+      } catch { db.increment('dmsFailed'); }
+      // Kick
+      try {
+        await member.kick('Gate sweep — unauthorized');
+        kicked++; db.increment('successfulKicks'); db.incrementVanityKick(vanity);
+        console.log(`🧹  Swept: ${member.user.tag}`);
+      } catch (err) {
+        failed++;
+        console.error(`🧹  Sweep kick fail ${member.user.tag}: ${err.message}`);
+      }
+      await sleep(1500);
+    }
+  } catch (err) { console.error(`⚠️  sweepGuild ${guild.name}: ${err.message}`); }
+  return { kicked, failed };
+}
+
+async function sweepAll() {
+  const guilds = [...client.guilds.cache.values()].filter(g => db.isGateActive(g.id));
+  if (!guilds.length) return;
+  console.log(`🧹  Sweeping ${guilds.length} active guild(s)...`);
+  let tk = 0, tf = 0;
+  for (const g of guilds) { const r = await sweepGuild(g); tk += r.kicked; tf += r.failed; await sleep(500); }
+  console.log(`🧹  Sweep done — ${tk} kicked, ${tf} failed`);
+  await postLog(new EmbedBuilder().setColor(tk > 0 ? 0xff4444 : 0x00cc66).setTitle('🧹 Gate Sweep Complete')
+    .setDescription(tk > 0 ? `Removed ${tk} unauthorized member${tk !== 1 ? 's' : ''}.` : 'No unauthorized members found.')
+    .addFields({ name: '✅ Kicked', value: `\`${tk}\``, inline: true }, { name: '❌ Failed', value: `\`${tf}\``, inline: true }, { name: '🏰 Servers', value: `\`${guilds.length}\``, inline: true })
+    .setTimestamp());
+}
+
+// ── Log helpers ───────────────────────────────────────────────────────────────
 
 async function postLog(embed) {
   const id = db.getLogChannel();
   if (!id) return;
-  try {
-    const ch = await client.channels.fetch(id).catch(() => null);
-    if (ch) await ch.send({ embeds: [embed] });
-  } catch {}
+  try { const ch = await client.channels.fetch(id).catch(() => null); if (ch) await ch.send({ embeds: [embed] }); } catch {}
 }
 
-function statsFooter() {
-  const s = db.getStats();
-  return `Total Joined: ${s.totalJoins}  •  Total Kicked: ${s.successfulKicks}`;
-}
+function statsFooter() { const s = db.getStats(); return `Total Joined: ${s.totalJoins}  •  Total Kicked: ${s.successfulKicks}`; }
 
-// ── DM embed (only used when SEND_DMS=true) ───────────────────────────────────
+// ── DM embed ──────────────────────────────────────────────────────────────────
 
 function buildDMEmbed(guildName, vanityCode) {
-  const link = db.getInviteLink();
-  const tag  = db.getContactTag();
+  const link = db.getInviteLink(), tag = db.getContactTag();
   const v    = vanityCode ? `\`/${vanityCode}\`` : `\`${guildName}\``;
   const cta  = tag  ? `Join here or contact **${tag}**` : `Use the button below to join`;
   const body = link ? `${cta}\n\n${link}` : cta;
@@ -171,113 +302,41 @@ function buildDMRow() {
   );
 }
 
-// ── Sweep ─────────────────────────────────────────────────────────────────────
-
-async function sweepGuild(guild) {
-  if (!db.isGateActive(guild.id)) return { kicked: 0, failed: 0 };
-
-  let kicked = 0, failed = 0;
-  try {
-    const members = await guild.members.fetch();
-    const targets = [...members.values()].filter(m =>
-      !m.user.bot && m.id !== client.user.id && !db.isAuthorized(m.user.id)
-    );
-
-    if (!targets.length) return { kicked: 0, failed: 0 };
-
-    console.log(`🧹  ${guild.name}: sweeping ${targets.length} unauthorized member(s)`);
-    const vanity = await getVanity(guild);
-
-    for (const member of targets) {
-      try {
-        await member.kick('Gate sweep — unauthorized');
-        kicked++;
-        db.increment('successfulKicks');
-        db.incrementVanityKick(vanity);
-        console.log(`🧹  Swept: ${member.user.tag}`);
-
-        // Send DM after kick if enabled
-        if (cfg.sendDMs) {
-          try {
-            await member.user.send({ embeds: [buildDMEmbed(guild.name, vanity)], components: [buildDMRow()] });
-            db.increment('dmsSent');
-          } catch { db.increment('dmsFailed'); }
-        }
-      } catch (err) {
-        failed++;
-        console.error(`🧹  Sweep kick failed ${member.user.tag}: ${err.message}`);
-      }
-      await sleep(1500); // 1.5s between sweep kicks — well within rate limits
-    }
-  } catch (err) {
-    console.error(`⚠️  sweepGuild error in ${guild.name}: ${err.message}`);
-  }
-  return { kicked, failed };
-}
-
-async function sweepAll() {
-  const guilds = [...client.guilds.cache.values()].filter(g => db.isGateActive(g.id));
-  if (!guilds.length) return;
-  console.log(`🧹  Sweeping ${guilds.length} active guild(s)...`);
-  let tk = 0, tf = 0;
-  for (const guild of guilds) {
-    const { kicked, failed } = await sweepGuild(guild);
-    tk += kicked; tf += failed;
-    await sleep(500);
-  }
-  console.log(`🧹  Sweep done — ${tk} kicked, ${tf} failed`);
-  await postLog(new EmbedBuilder()
-    .setColor(tk > 0 ? 0xff4444 : 0x00cc66)
-    .setTitle('🧹 Gate Sweep Complete')
-    .setDescription(tk > 0 ? `Removed ${tk} unauthorized member${tk !== 1 ? 's' : ''} across ${guilds.length} server${guilds.length !== 1 ? 's' : ''}.` : 'No unauthorized members found.')
-    .addFields(
-      { name: '✅ Kicked',  value: `\`${tk}\``,           inline: true },
-      { name: '❌ Failed',  value: `\`${tf}\``,           inline: true },
-      { name: '🏰 Servers', value: `\`${guilds.length}\``, inline: true },
-    ).setTimestamp());
-}
-
 // ── Boost helpers ─────────────────────────────────────────────────────────────
 
 const TIER_NAMES  = ['No Level', 'Level 1', 'Level 2', 'Level 3'];
 const TIER_EMOJI  = ['⬜', '🟣', '💜', '✨'];
 const TIER_THRESH = [0, 2, 7, 14];
 
-function getBoostInfo(guild) {
-  const count = guild.premiumSubscriptionCount || 0;
-  const tier  = guild.premiumTier              || 0;
+function getBoostInfo(g) {
+  const count = g.premiumSubscriptionCount || 0, tier = g.premiumTier || 0;
   const next  = tier < 3 ? TIER_THRESH[tier + 1] : null;
   return { count, tier, next, needed: next ? next - count : 0, emoji: TIER_EMOJI[tier], name: TIER_NAMES[tier] };
 }
 
-function progBar(cur, max, len = 10) {
-  if (!max) return '░'.repeat(len);
-  const f = Math.min(len, Math.round((cur / max) * len));
-  return '▓'.repeat(f) + '░'.repeat(len - f);
-}
+function progBar(c, m, l = 10) { if (!m) return '░'.repeat(l); const f = Math.min(l, Math.round((c / m) * l)); return '▓'.repeat(f) + '░'.repeat(l - f); }
 
-function buildBoostsEmbed(sorted, page, totalPages) {
+function buildBoostsEmbed(sorted, page, totPages) {
   const slice = sorted.slice(page * 8, (page + 1) * 8);
   const total = sorted.reduce((s, g) => s + (g.premiumSubscriptionCount || 0), 0);
   const tiers = [0, 0, 0, 0]; sorted.forEach(g => tiers[g.premiumTier || 0]++);
-  const embed = new EmbedBuilder().setColor(0xf47fff).setTitle('🚀 Server Boost Status')
-    .setDescription(`**${sorted.length}** servers  •  **${total}** total boosts\n✨ ${tiers[3]} L3  •  💜 ${tiers[2]} L2  •  🟣 ${tiers[1]} L1  •  ⬜ ${tiers[0]} none\nPage **${page + 1} / ${totalPages}**`)
-    .setTimestamp();
+  const e = new EmbedBuilder().setColor(0xf47fff).setTitle('🚀 Server Boost Status')
+    .setDescription(`**${sorted.length}** servers  •  **${total}** total boosts\n✨${tiers[3]} L3  •  💜${tiers[2]} L2  •  🟣${tiers[1]} L1  •  ⬜${tiers[0]} none\nPage **${page + 1} / ${totPages}**`).setTimestamp();
   for (const g of slice) {
     const { count, tier, next, needed, emoji, name } = getBoostInfo(g);
     const gn = g.name.length > 35 ? g.name.slice(0, 32) + '...' : g.name;
-    embed.addFields({ name: gn, inline: false, value: next !== null
+    e.addFields({ name: gn, inline: false, value: next !== null
       ? `${emoji} **${name}** — **${count}** boost${count !== 1 ? 's' : ''}\n\`[${progBar(count, next)}]\` ${count}/${next} → Level ${tier + 1} (+${needed})`
       : `✨ **Level 3 (Max)** — **${count}** boosts` });
   }
-  return embed;
+  return e;
 }
 
-function buildBoostsRow(page, totalPages) {
+function buildBoostsRow(page, tot) {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`bp_${page - 1}`).setLabel('◀  Prev').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
-    new ButtonBuilder().setCustomId('bm').setLabel(`${page + 1} / ${totalPages}`).setStyle(ButtonStyle.Primary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`bn_${page + 1}`).setLabel('Next  ▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1),
+    new ButtonBuilder().setCustomId('bm').setLabel(`${page + 1} / ${tot}`).setStyle(ButtonStyle.Primary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`bn_${page + 1}`).setLabel('Next  ▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= tot - 1),
   );
 }
 
@@ -292,7 +351,6 @@ async function sendBoostAlert(embed) {
 function formatDate(iso) { return new Date(iso).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' }); }
 function guildLabel(id)  { const g = client.guilds.cache.get(String(id)); return g ? `**${g.name}** (\`${id}\`)` : `\`${id}\``; }
 function parseIds(raw)   { return (raw || '').split(',').map(s => s.trim()).filter(s => /^\d{10,20}$/.test(s)); }
-
 async function fetchInviteUses(url) {
   const m = (url || '').match(/(?:discord\.gg|discord\.com\/invite)\/([a-zA-Z0-9-]+)/);
   if (!m) return null;
@@ -304,32 +362,20 @@ async function fetchInviteUses(url) {
 client.once(Events.ClientReady, async () => {
   console.log(`\n✅  Online as ${client.user.tag}`);
   console.log(`🛡️  Gate: ${db.getGate() ? 'ON' : 'OFF'} | Exceptions: ${db.getGateExceptions().size} | Whitelist: ${db.getWhitelist().size}`);
-  console.log(`📝  Log: ${db.getLogChannel() || 'not set'} | Boost: ${db.getBoostChannelId() || 'not set'}`);
-  console.log(`📬  DMs: ${cfg.sendDMs ? 'ON' : 'OFF'}\n`);
+  console.log(`⏱️   DM gap: ${cfg.dmDelay}ms (~${Math.round(60000 / cfg.dmDelay)} DMs/min max)\n`);
 
   const guilds = [...client.guilds.cache.values()];
   guilds.forEach(g => {
-    const active = db.isGateActive(g.id);
-    const bot    = g.members.me;
-    const hasKick = bot?.permissions.has(PermissionsBitField.Flags.KickMembers);
-    const icon   = active ? (hasKick ? '🟢' : '⚠️') : '🔴';
-    console.log(`  ${icon} ${g.name} — gate ${active ? 'ON' : 'OFF'}${!hasKick && active ? ' ← MISSING KICK PERMISSION' : ''}`);
+    const active  = db.isGateActive(g.id);
+    const hasKick = g.members.me?.permissions.has(PermissionsBitField.Flags.KickMembers);
+    console.log(`  ${active ? '🟢' : '🔴'} ${g.name}${active && !hasKick ? ' ⚠️  MISSING KICK PERMISSION' : ''}`);
   });
   console.log('');
 
   await syncAllGuilds();
 
-  // Cache vanity URLs for all guilds on startup (non-blocking, best effort)
-  for (const guild of guilds) {
-    await getVanity(guild).catch(() => {});
-    await sleep(200);
-  }
-
-  setInterval(() => {
-    const gs = [...client.guilds.cache.values()];
-    const tb = gs.reduce((s, g) => s + (g.premiumSubscriptionCount || 0), 0);
-    console.log(`🔄  Boost: ${tb} total across ${gs.length} servers`);
-  }, 30 * 60 * 1000);
+  // Pre-cache vanity URLs (non-blocking, best-effort)
+  for (const g of guilds) { await getVanity(g).catch(() => {}); await sleep(300); }
 });
 
 client.on(Events.GuildCreate, async (guild) => {
@@ -340,20 +386,19 @@ client.on(Events.GuildCreate, async (guild) => {
 
 // ── Boost events ──────────────────────────────────────────────────────────────
 
-client.on(Events.GuildMemberUpdate, async (oldMember, newMember) => {
-  const was = !!oldMember.premiumSince, is = !!newMember.premiumSince;
+client.on(Events.GuildMemberUpdate, async (oldM, newM) => {
+  const was = !!oldM.premiumSince, is = !!newM.premiumSince;
   if (was === is) return;
-  const guild = newMember.guild, gained = !was && is;
+  const guild = newM.guild, gained = !was && is;
   const { count, emoji, name, next, needed } = getBoostInfo(guild);
-  console.log(`${gained ? '🎉' : '💔'} Boost ${gained ? 'added' : 'removed'}: ${newMember.user.tag} in ${guild.name}`);
-  await sendBoostAlert(new EmbedBuilder()
-    .setColor(gained ? 0xf47fff : 0xff4444)
+  console.log(`${gained ? '🎉' : '💔'} Boost ${gained ? 'added' : 'removed'}: ${newM.user.tag} in ${guild.name}`);
+  await sendBoostAlert(new EmbedBuilder().setColor(gained ? 0xf47fff : 0xff4444)
     .setTitle(gained ? `🎉 New Boost — ${guild.name}` : `💔 Boost Removed — ${guild.name}`)
-    .setThumbnail(newMember.user.displayAvatarURL())
+    .setThumbnail(newM.user.displayAvatarURL())
     .addFields(
-      { name: gained ? '🚀 Started Boosting' : '❌ Stopped Boosting', value: `${newMember.user.tag}\n<@${newMember.user.id}>`, inline: true },
+      { name: gained ? '🚀 Started Boosting' : '❌ Stopped Boosting', value: `${newM.user.tag}\n<@${newM.user.id}>`, inline: true },
       { name: '📊 Boosts', value: `**${count}**`, inline: true },
-      { name: '🏆 Tier',   value: next ? `${emoji} **${name}** — ${needed} more to next` : `✨ **Level 3**`, inline: true },
+      { name: '🏆 Tier',   value: next ? `${emoji} **${name}** — ${needed} more to next` : '✨ **Level 3**', inline: true },
     ).setTimestamp());
 });
 
@@ -362,18 +407,17 @@ client.on(Events.GuildMemberRemove, async (member) => {
   const guild = member.guild;
   const { count, emoji, name, next, needed } = getBoostInfo(guild);
   console.log(`⚠️  Booster left: ${member.user.tag} from ${guild.name}`);
-  await sendBoostAlert(new EmbedBuilder()
-    .setColor(0xff8c00).setTitle(`⚠️ Booster Left — ${guild.name}`)
+  await sendBoostAlert(new EmbedBuilder().setColor(0xff8c00).setTitle(`⚠️ Booster Left — ${guild.name}`)
     .setThumbnail(member.user.displayAvatarURL())
     .addFields(
-      { name: '👤 Member',   value: `${member.user.tag}\n<@${member.user.id}>`, inline: true },
-      { name: '📊 Boosts',   value: `**${count}**`, inline: true },
-      { name: '🏆 Tier',     value: next ? `${emoji} **${name}** — ${needed} more to next` : `✨ **Level 3**`, inline: true },
-      { name: '⚠️ Note',    value: 'This member was boosting — their boost has been removed.', inline: false },
+      { name: '👤 Member', value: `${member.user.tag}\n<@${member.user.id}>`, inline: true },
+      { name: '📊 Boosts', value: `**${count}**`, inline: true },
+      { name: '🏆 Tier',   value: next ? `${emoji} **${name}** — ${needed} more to next` : '✨ **Level 3**', inline: true },
+      { name: '⚠️ Note',  value: 'This member was boosting — their boost has been removed.', inline: false },
     ).setTimestamp());
 });
 
-// ── Member join — clean, simple, reliable kick logic ─────────────────────────
+// ── Member join ───────────────────────────────────────────────────────────────
 
 client.on(Events.GuildMemberAdd, async (member) => {
   if (member.user.bot) return;
@@ -381,9 +425,8 @@ client.on(Events.GuildMemberAdd, async (member) => {
   db.increment('totalJoins');
   const guild     = member.guild;
   const createdAt = Math.floor(member.user.createdTimestamp / 1000);
-  const joinedAt  = Math.floor(Date.now() / 1000);
 
-  // ── 1. Authorized? ──────────────────────────────────────────────────────────
+  // 1. Authorized?
   if (db.isAuthorized(member.user.id)) {
     db.increment('authorizedJoins');
     console.log(`✅ [AUTH] ${member.user.tag} in ${guild.name}`);
@@ -398,12 +441,10 @@ client.on(Events.GuildMemberAdd, async (member) => {
     return;
   }
 
-  // ── 2. Gate active? ─────────────────────────────────────────────────────────
+  // 2. Gate active?
   if (!db.isGateActive(guild.id)) {
     db.increment('gateOffJoins');
-    const reason = !db.getGate()
-      ? 'Global gate is OFF'
-      : 'This server is individually excepted';
+    const reason = !db.getGate() ? 'Global gate is OFF' : 'Server is individually excepted';
     console.log(`⏸️ [GATE OFF] ${member.user.tag} in ${guild.name} — ${reason}`);
     await postLog(new EmbedBuilder().setColor(0xf0a500).setTitle('⏸️ Unauthorized — Gate Off (Not Kicked)')
       .setThumbnail(member.user.displayAvatarURL())
@@ -411,78 +452,30 @@ client.on(Events.GuildMemberAdd, async (member) => {
         { name: 'Server',  value: `${guild.name} (\`${guild.id}\`)`,         inline: false },
         { name: 'User',    value: `${member.user.tag}\n<@${member.user.id}>`, inline: true  },
         { name: 'ID',      value: `\`${member.user.id}\``,                    inline: true  },
-        { name: 'Account', value: `<t:${createdAt}:R>`,                       inline: true  },
         { name: 'Reason',  value: reason,                                     inline: false },
       ).setFooter({ text: statsFooter() }).setTimestamp());
     return;
   }
 
-  // ── 3. Gate is active — kick immediately ────────────────────────────────────
-  console.log(`🚨 [KICK] ${member.user.tag} (${member.user.id}) in ${guild.name} (${guild.id})`);
-
-  let kickOk = false, kickErr = '';
-  try {
-    await member.kick('Unauthorized — not on the whitelist.');
-    kickOk = true;
-    db.increment('successfulKicks');
-    console.log(`✅ [KICKED] ${member.user.tag} from ${guild.name}`);
-  } catch (err) {
-    kickErr = err.message;
-    db.increment('failedKicks');
-    console.error(`❌ [KICK FAILED] ${member.user.tag} in ${guild.name}: ${err.message}`);
-  }
-
-  // ── 4. Update vanity tracking ────────────────────────────────────────────────
-  const vanity = vanityCache.get(guild.id) || null;
-  db.incrementVanityJoin(vanity);
-  if (kickOk) db.incrementVanityKick(vanity);
-
-  // ── 5. DM — only if kick succeeded AND DMs are enabled ───────────────────────
-  let dmSent = false, dmErr = '';
-  if (kickOk && cfg.sendDMs) {
-    try {
-      await member.user.send({ embeds: [buildDMEmbed(guild.name, vanity)], components: [buildDMRow()] });
-      dmSent = true;
-      db.increment('dmsSent');
-    } catch (err) {
-      dmErr = err.message;
-      db.increment('dmsFailed');
-      console.warn(`⚠️ [DM FAILED] ${member.user.tag}: ${err.message}`);
-    }
-  }
-
-  // ── 6. Log to channel ────────────────────────────────────────────────────────
-  await postLog(new EmbedBuilder()
-    .setColor(kickOk ? 0xff4444 : 0xff9900)
-    .setTitle(kickOk ? '🚫 Unauthorized Member Kicked' : '⚠️ Kick Failed')
-    .setThumbnail(member.user.displayAvatarURL())
-    .addFields(
-      { name: 'Server',  value: `${guild.name} (\`${guild.id}\`)`,                         inline: false },
-      { name: 'Vanity',  value: vanity ? `\`/${vanity}\`` : '_None_',                      inline: true  },
-      { name: 'User',    value: `${member.user.tag}\n<@${member.user.id}>`,                inline: true  },
-      { name: 'ID',      value: `\`${member.user.id}\``,                                   inline: true  },
-      { name: 'Account', value: `<t:${createdAt}:R>`,                                      inline: true  },
-      { name: 'Joined',  value: `<t:${joinedAt}:R>`,                                       inline: true  },
-      { name: 'Kick',    value: kickOk ? '✅ Success' : `❌ Failed\n\`${kickErr}\`\n*Check bot role position in Server Settings → Roles*`, inline: true },
-      ...(cfg.sendDMs ? [{ name: 'DM', value: dmSent ? '✅ Sent' : `❌ Failed\n\`${dmErr}\``, inline: true }] : []),
-    ).setFooter({ text: statsFooter() }).setTimestamp());
+  // 3. Gate active — add to queue (DM → kick, rate limited)
+  enqueue(member, guild);
 });
 
 // ── Slash commands + buttons ──────────────────────────────────────────────────
 
 client.on(Events.InteractionCreate, async (interaction) => {
 
-  // Boost pagination buttons
+  // Boost pagination
   if (interaction.isButton()) {
     const id = interaction.customId;
     if (id !== 'bm' && !id.startsWith('bp_') && !id.startsWith('bn_')) return;
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator))
       return interaction.reply({ content: '❌ Administrator permission required.', ephemeral: true });
     if (id === 'bm') return interaction.deferUpdate();
-    const page   = parseInt(id.split('_')[1]);
-    const guilds = [...client.guilds.cache.values()].sort((a, b) => (b.premiumSubscriptionCount || 0) - (a.premiumSubscriptionCount || 0));
-    const tot    = Math.max(1, Math.ceil(guilds.length / 8));
-    return interaction.update({ embeds: [buildBoostsEmbed(guilds, page, tot)], components: [buildBoostsRow(page, tot)] });
+    const page = parseInt(id.split('_')[1]);
+    const gs   = [...client.guilds.cache.values()].sort((a, b) => (b.premiumSubscriptionCount || 0) - (a.premiumSubscriptionCount || 0));
+    const tot  = Math.max(1, Math.ceil(gs.length / 8));
+    return interaction.update({ embeds: [buildBoostsEmbed(gs, page, tot)], components: [buildBoostsRow(page, tot)] });
   }
 
   if (!interaction.isChatInputCommand()) return;
@@ -519,20 +512,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xf0a500)
           .setTitle(`⏸️ Gate Off for ${ids.length} Server${ids.length !== 1 ? 's' : ''}`)
           .setDescription(`Not kicking in:\n${ids.map(id => `• ${guildLabel(id)}`).join('\n')}` +
-            (wasOff ? '\n\n⚠️ Global gate was OFF — **automatically enabled** for all other servers.' : '\n\nAll other servers still kick.'))
+            (wasOff ? '\n\n⚠️ Global gate was OFF — **auto-enabled** for all other servers.' : '\n\nAll other servers still kick.'))
           .setTimestamp()], ephemeral: true });
       }
       if (sub === 'remove') {
         const raw = interaction.options.getString('id');
         const id  = raw?.trim() || interaction.guild.id;
-        if (!/^\d{10,20}$/.test(id)) return interaction.reply({ content: '❌ Invalid ID.', ephemeral: true });
+        if (!/^\d{10,20}$/.test(id)) return interaction.reply({ content: '❌ Invalid server ID.', ephemeral: true });
         if (!db.getGateExceptions().has(String(id)))
-          return interaction.reply({ content: `⚠️ \`${id}\` is not in exceptions. Check \`/gate status\`.`, ephemeral: true });
+          return interaction.reply({ content: `⚠️ \`${id}\` is not excepted. Check \`/gate status\`.`, ephemeral: true });
         db.removeGateException(id);
         const active = db.isGateActive(id);
         await interaction.reply({ embeds: [new EmbedBuilder().setColor(active ? 0x00cc66 : 0xf0a500)
           .setTitle('✅ Exception Removed')
-          .setDescription(`${guildLabel(id)}\n\n**Gate is now: ${active ? '🟢 ON — will kick' : '🔴 still OFF (global gate is off)'}**` +
+          .setDescription(`${guildLabel(id)}\n\n**Gate: ${active ? '🟢 ON — will now kick' : '🔴 still OFF (global gate is off)'}**` +
             (active ? '\n\n🧹 Sweeping for unauthorized members...' : '')).setTimestamp()], ephemeral: true });
         if (active) { const tg = client.guilds.cache.get(String(id)); if (tg) sweepGuild(tg).catch(() => {}); }
         return;
@@ -541,8 +534,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ex = db.getGateExceptions();
         if (!ex.size) return interaction.reply({ content: '📋 No per-server exceptions.', ephemeral: true });
         return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xf0a500).setTitle(`⏸️ Excepted Servers (${ex.size})`)
-          .setDescription([...ex].map(id => `• ${guildLabel(id)}`).join('\n'))
-          .setFooter({ text: 'These never kick regardless of global gate' }).setTimestamp()], ephemeral: true });
+          .setDescription([...ex].map(id => `• ${guildLabel(id)}`).join('\n')).setFooter({ text: 'Never kick regardless of global gate' }).setTimestamp()], ephemeral: true });
       }
       if (sub === 'clear') {
         const c = db.getGateExceptions().size; db.clearGateExceptions();
@@ -557,7 +549,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       db.setGate(true);
       const ex = db.getGateExceptions().size;
       await interaction.reply({ embeds: [new EmbedBuilder().setColor(0x00cc66).setTitle('🛡️ Gate Enabled')
-        .setDescription('Gate is ON. Kicking unauthorized members on join.\n\n🧹 **Sweeping active servers for unauthorized members — results in log channel.**' +
+        .setDescription('Gate is **ON**. Unauthorized joins will be DM\'d then kicked.\n\n🧹 **Sweeping active servers for unauthorized members — results in log channel.**' +
           (ex > 0 ? `\n\n⚠️ ${ex} server${ex !== 1 ? 's are' : ' is'} still individually excepted.` : '')).setTimestamp()] });
       sweepAll().catch(() => {});
       return;
@@ -596,10 +588,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }).join('\n') || '_none_';
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(on ? 0x00cc66 : 0xf0a500).setTitle('🛡️ Gate Status')
         .addFields(
-          { name: 'Global Gate', value: on ? '🟢 **ON**' : '🔴 **OFF**', inline: false },
+          { name: 'Global Gate', value: on ? '🟢 **ON**' : '🔴 **OFF**', inline: true },
+          { name: '⏱️ DM Queue', value: `${kickQueue.length} pending`, inline: true },
+          { name: '\u200b', value: '\u200b', inline: true },
           { name: `Exceptions (${ex.size})`, value: ex.size ? [...ex].map(id => `• ${guildLabel(id)}`).join('\n') : '_None_', inline: false },
           { name: 'Per-Server State', value: lines, inline: false },
-        ).setFooter({ text: '⚠️ NO KICK PERM = move bot role above members in Server Settings → Roles' }).setTimestamp()], ephemeral: true });
+        ).setFooter({ text: '⚠️ NO KICK PERM = move bot role above member roles in Server Settings → Roles' }).setTimestamp()], ephemeral: true });
     }
   }
 
@@ -633,7 +627,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // /setinvite
   if (commandName === 'setinvite') {
     const url = interaction.options.getString('url');
-    if (!url.startsWith('http')) return interaction.reply({ content: '❌ Provide a full URL (https://...).', ephemeral: true });
+    if (!url.startsWith('http')) return interaction.reply({ content: '❌ Provide a full URL.', ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     db.setInviteLink(url);
     const uses = await fetchInviteUses(url); if (uses !== null) db.setInviteBaseline(uses);
@@ -676,11 +670,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const conv  = sent > 0 && since !== null ? `${((since / sent) * 100).toFixed(1)}%` : 'N/A';
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x0d0d1a).setTitle('🔗 Invite Link Stats')
       .addFields(
-        { name: '🔗 Link',          value: url,                                        inline: false },
-        { name: '📨 DMs Sent',      value: `\`${sent}\``,                              inline: true  },
-        { name: '🖱️ Uses Since Set',value: since !== null ? `\`${since}\`` : '`N/A`', inline: true  },
-        { name: '📊 All-Time',      value: total !== null ? `\`${total}\`` : '`N/A`', inline: true  },
-        { name: '📈 Conversion',    value: `\`${conv}\``,                              inline: true  },
+        { name: '🔗 Link',            value: url,                                         inline: false },
+        { name: '📨 DMs Sent',        value: `\`${sent}\``,                               inline: true  },
+        { name: '🖱️ Uses Since Set',  value: since !== null ? `\`${since}\`` : '`N/A`',  inline: true  },
+        { name: '📊 All-Time Uses',   value: total !== null ? `\`${total}\`` : '`N/A`',  inline: true  },
+        { name: '📈 Conversion',      value: `\`${conv}\``,                               inline: true  },
       ).setFooter({ text: 'Live from Discord API' }).setTimestamp()] });
   }
 
@@ -695,22 +689,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const dt  = s.dmsSent + s.dmsFailed, dr = dt > 0 ? `${((s.dmsSent / dt) * 100).toFixed(1)}%` : 'N/A';
       return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x0d0d1a).setTitle('📊 Statistics')
         .addFields(
-          { name: '🛡️ Gate',  value: db.getGate() ? '🟢 ON' : '🔴 OFF', inline: true },
-          { name: '🔕 Except',value: `${db.getGateExceptions().size}`,    inline: true },
-          { name: '⏱️ Uptime',value: upt,                                 inline: true },
+          { name: '🛡️ Gate',    value: db.getGate() ? '🟢 ON' : '🔴 OFF', inline: true },
+          { name: '⏳ DM Queue', value: `${kickQueue.length} pending`,        inline: true },
+          { name: '⏱️ Uptime',  value: upt,                                   inline: true },
           { name: '\u200b', value: '**── Joins ──**', inline: false },
-          { name: '👥 Total',   value: `\`${s.totalJoins}\``,      inline: true },
-          { name: '✅ Auth',    value: `\`${s.authorizedJoins}\``, inline: true },
-          { name: '⏸️ Allowed',value: `\`${s.gateOffJoins}\``,    inline: true },
+          { name: '👥 Total',    value: `\`${s.totalJoins}\``,      inline: true },
+          { name: '✅ Auth',     value: `\`${s.authorizedJoins}\``, inline: true },
+          { name: '⏸️ Allowed', value: `\`${s.gateOffJoins}\``,    inline: true },
           { name: '\u200b', value: '**── Kicks ──**', inline: false },
-          { name: '👢 OK',   value: `\`${s.successfulKicks}\``, inline: true },
-          { name: '❌ Fail', value: `\`${s.failedKicks}\``,     inline: true },
-          { name: '📈 Rate', value: `\`${kr}\``,                inline: true },
+          { name: '👢 OK',    value: `\`${s.successfulKicks}\``, inline: true },
+          { name: '❌ Fail',  value: `\`${s.failedKicks}\``,     inline: true },
+          { name: '📈 Rate',  value: `\`${kr}\``,                inline: true },
           { name: '\u200b', value: '**── DMs ──**', inline: false },
-          { name: `📨 ${cfg.sendDMs ? 'Sent' : 'Sent (DMs off)'}`, value: `\`${s.dmsSent}\``,   inline: true },
-          { name: '📭 Failed',                                     value: `\`${s.dmsFailed}\``, inline: true },
-          { name: '📬 Rate',                                       value: `\`${dr}\``,           inline: true },
-        ).setFooter({ text: `DMs: ${cfg.sendDMs ? 'ON' : 'OFF (set SEND_DMS=true in Railway to enable)'}` }).setTimestamp()], ephemeral: true });
+          { name: '📨 Sent',  value: `\`${s.dmsSent}\``,   inline: true },
+          { name: '📭 Failed',value: `\`${s.dmsFailed}\``, inline: true },
+          { name: '📬 Rate',  value: `\`${dr}\``,           inline: true },
+        ).setFooter({ text: `DM rate: 1 per ${cfg.dmDelay}ms  •  /log reset to clear` }).setTimestamp()], ephemeral: true });
     }
   }
 
@@ -719,15 +713,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0x0d0d1a).setTitle('⚙️ Configuration')
       .setDescription('Static → Railway Variables  •  Dynamic → volume')
       .addFields(
-        { name: '🏷️ Brand',     value: cfg.brandName || '_Not set_',                                                                inline: false },
-        { name: '🖼️ Banner',   value: cfg.bannerUrl  || '_Not set_',                                                                inline: false },
-        { name: '📝 Log Ch',   value: db.getLogChannel()     ? `<#${db.getLogChannel()}>` : '_Not set_',                            inline: true  },
-        { name: '🚀 Boost Ch', value: db.getBoostChannelId() ? `<#${db.getBoostChannelId()}>` : '_Not set_',                       inline: true  },
-        { name: '🔗 Invite',   value: db.getInviteLink() || '_Not set_',                                                             inline: false },
-        { name: '👤 Contact',  value: db.getContactTag(),                                                                            inline: true  },
-        { name: '🛡️ Gate',    value: db.getGate() ? '🟢 ON' : '🔴 OFF',                                                           inline: true  },
-        { name: '📬 DMs',      value: cfg.sendDMs ? '✅ ON' : '❌ OFF (SEND_DMS=true to enable)',                                   inline: true  },
-        { name: '📋 Whitelist',value: `${db.getWhitelist().size} user(s)`,                                                          inline: true  },
+        { name: '🏷️ Brand',     value: cfg.brandName || '_Not set_',                                                   inline: false },
+        { name: '🖼️ Banner',   value: cfg.bannerUrl  || '_Not set_',                                                   inline: false },
+        { name: '📝 Log Ch',   value: db.getLogChannel()     ? `<#${db.getLogChannel()}>` : '_Not set_',               inline: true  },
+        { name: '🚀 Boost Ch', value: db.getBoostChannelId() ? `<#${db.getBoostChannelId()}>` : '_Not set_',           inline: true  },
+        { name: '🔗 Invite',   value: db.getInviteLink() || '_Not set_',                                               inline: false },
+        { name: '👤 Contact',  value: db.getContactTag(),                                                              inline: true  },
+        { name: '🛡️ Gate',    value: db.getGate() ? '🟢 ON' : '🔴 OFF',                                              inline: true  },
+        { name: '⏱️ DM Rate',  value: `1 per ${cfg.dmDelay}ms`,                                                       inline: true  },
+        { name: '📋 Whitelist',value: `${db.getWhitelist().size} user(s)`,                                            inline: true  },
       )], ephemeral: true });
   }
 
@@ -737,14 +731,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setDescription('All commands require **Administrator** permission.')
       .addFields(
         { name: '🔐 Whitelist', value: '`/whitelist add @user`  `remove`  `list`' },
-        { name: '🛡️ Gate — Global', value: '`/gate on` — enable + immediate sweep\n`/gate off` — disable ALL servers\n`/gate status` — shows state + kick permissions\n`/gate reset` — force ON + clear + sweep\n`/gate sweep` — manual kick sweep now' },
-        { name: '🛡️ Gate — Per Server', value: '`/gate server add [ids:123,456]` — turn off for specific servers\n`/gate server remove [id]` — re-enable + sweep\n`/gate server list`  `clear`' },
-        { name: '🚀 Boost Monitoring', value: '`/boosts` — paginated boost status (◀▶)\n`/setboostchannel #ch` — boost alert channel' },
-        { name: '✉️ Kick DM', value: '`/setinvite <url>`  `setcontact <tag>`\n> DMs are **OFF by default** to prevent Discord quarantine.\n> Set `SEND_DMS=true` in Railway Variables to enable.' },
-        { name: '📊 Stats & Tracking', value: '`/vanitystats [vanity]`  `linkstats`  `log stats`  `log reset`' },
-        { name: '📝 Setup', value: '`/setlog #channel`  `setboostchannel #channel`  `config`' },
-        { name: '⚠️ Kicks not working?', value: '1. Run `/gate status` — check for `⚠️ NO KICK PERM`\n2. **Server Settings → Roles** → move bot role above member roles\n3. Give bot **Kick Members** permission\n4. Run `/gate sweep` to catch anyone who slipped through' },
-      ).setFooter({ text: 'Railway deploy logs show every kick attempt in real time' }).setTimestamp()], ephemeral: true });
+        { name: '🛡️ Gate — Global', value: '`/gate on` — enable + sweep\n`/gate off` — disable ALL\n`/gate status` — state + kick permissions + queue depth\n`/gate reset` — force ON + clear + sweep\n`/gate sweep` — manual sweep' },
+        { name: '🛡️ Gate — Per Server', value: '`/gate server add [ids:123,456]`\n`/gate server remove [id]`  `list`  `clear`' },
+        { name: '🚀 Boost Monitoring', value: '`/boosts` — paginated boost status\n`/setboostchannel #ch`' },
+        { name: '✉️ Kick DM', value: '`/setinvite <url>`  `/setcontact <tag>`\n> DMs are sent **before** every kick, queued at 1 per 1.2s to avoid rate limits.\n> Set `DM_DELAY=500` in Railway Variables to process faster (higher risk).' },
+        { name: '📊 Stats', value: '`/vanitystats [vanity]`  `linkstats`  `log stats`  `log reset`' },
+        { name: '📝 Setup', value: '`/setlog #channel`  `setboostchannel #ch`  `config`' },
+        { name: '⚠️ Kicks failing?', value: '1. `/gate status` — check for `⚠️ NO KICK PERM`\n2. Server Settings → Roles → move bot role **above** member roles\n3. Give bot **Kick Members** permission\n4. `/gate sweep` to catch anyone who slipped through' },
+      ).setFooter({ text: 'DMs always sent before kicks • Queue visible in /gate status and /log stats' }).setTimestamp()], ephemeral: true });
   }
 });
 

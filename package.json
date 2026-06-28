@@ -1,7 +1,7 @@
 {
   "name": "discord-vanity-gate-bot",
-  "version": "14.0.0",
-  "description": "Clean, reliable gate bot. DMs off by default to prevent quarantine.",
+  "version": "15.0.0",
+  "description": "Gate bot with DM queue — DM always before kick, rate limited to avoid Discord quarantine.",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "engines": { "node": ">=18" },

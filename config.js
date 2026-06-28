@@ -14,9 +14,9 @@ function getConfig() {
     bannerUrl: process.env.BANNER_URL || null,
     iconUrl:   process.env.ICON_URL   || null,
     brandName: process.env.BRAND_NAME || 'Smoke - SmokeURLs',
-    // DMs are OFF by default to prevent Discord quarantine.
-    // Set SEND_DMS=true in Railway once your bot is unquarantined.
-    sendDMs:   process.env.SEND_DMS === 'true',
+    // Gap between each DM send (ms). 1200 = ~50 DMs/min, very safe.
+    // Lower = faster processing but higher rate limit risk.
+    dmDelay:   parseInt(process.env.DM_DELAY || '1200', 10),
   };
 }
 
