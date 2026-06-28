@@ -1,0 +1,9 @@
+{
+  "name": "discord-vanity-gate-bot",
+  "version": "14.0.0",
+  "description": "Clean, reliable gate bot. DMs off by default to prevent quarantine.",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "discord.js": "^14.15.3", "dotenv": "^16.4.5" }
+}
